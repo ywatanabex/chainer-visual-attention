@@ -224,7 +224,7 @@ class ReinforceClassifier1(ReinforceClassifier):
             b = 0
         else:
             raise ValueError('Unknown baseline mode')
-        penalty = (miss - b.data)
+        penalty = (miss - b)
         loss_r = F.sum(loss_R0 * chainer.Variable(penalty, volatile=chainer.flag.AUTO)) / batchsize
         loss_total = loss_c + self.coeff * loss_r
         if self.baseline == 'adaptive':
