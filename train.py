@@ -87,7 +87,7 @@ class RAM0(chainer.Chain):
         h_out = self.lstm(h2)
         self.h_out = h_out
         c = self.lc(h_out)
-        l_out = F.sigmoid(self.ll(h_out))
+        l_out = 0.15 + 0.7 * F.sigmoid(self.ll(h_out))  # trick to avoid boundary sticking
         return c, l_out
 
     def sample_location(self, l_data):
@@ -108,6 +108,39 @@ class RAM0(chainer.Chain):
         term1 = 0.5 * (l - mean)**2 * self.sigma**-2
         term2 = 0.5 * np.log(2 * np.pi * self.sigma**2)
         return F.sum(term1 + term2, axis=1)
+
+
+class RAM1(RAM0):
+    """
+    Network design is modified from RAM0
+    """
+    def __init__(self, n_units, n_hidden, n_in, n_class, sigma, train=True):
+        chainer.Chain.__init__(self,
+            ll1=L.Linear(2, n_hidden),          # 2 is x,y coordinate dimension
+            lrho1=L.Linear(n_in, n_hidden),
+            lrho2=L.Linear(n_hidden, n_hidden),
+            lstm=L.LSTM(n_hidden, n_hidden),
+            lc=L.Linear(n_hidden, n_class),    # class output
+            ll=L.Linear(n_hidden, 2),          # location output
+            lb=L.Linear(n_hidden, 1),          # baseline output
+            )
+        self.sigma = sigma
+        self.train = train
+
+    def __call__(self, l, rho):
+        """
+        :param l: center of cropping (from 0 to 1)
+        :param rho: cropped image
+        """
+        g0 = F.relu(self.ll1(l))
+        k0 = F.relu(self.lrho1(rho))
+        k1 = F.relu(self.lrho2(k0))
+        # lstm
+        h_out = self.lstm(g0 + k1)
+        self.h_out = h_out
+        c = self.lc(h_out)
+        l_out = 0.15 + 0.7 * F.sigmoid(self.ll(h_out))  # trick to avoid boundary sticking
+        return c, l_out
 
 
 class ReinforceClassifier(chainer.Chain):
@@ -134,7 +167,7 @@ class ReinforceClassifier(chainer.Chain):
         xp = cuda.get_array_module(x.data)
         self.ram.reset_state()
         l = chainer.Variable(xp.zeros((batchsize, 2)).astype(np.float32)+0.5, volatile=chainer.flag.AUTO)  # start from center
-        loss_R0 = 0
+        loss_R0_list = []
         self.l_list = [l]
 
         for s in range(self.len_seq):
@@ -144,7 +177,7 @@ class ReinforceClassifier(chainer.Chain):
                                    volatile=chainer.flag.AUTO)
             # REINFORCE loss
             if s < self.len_seq - 1:
-                loss_R0 = self.ram.get_location_loss(l, l_sampled)
+                loss_R0_list.append(self.ram.get_location_loss(l, l_sampled))
             # compute next step
             ls = chainer.Variable(xp.array(l_sampled), volatile=chainer.flag.AUTO)
             c, l = self.ram(ls, rho)
@@ -168,11 +201,12 @@ class ReinforceClassifier(chainer.Chain):
         else:
             raise ValueError('Unknown baseline mode')
         penalty = (loss_c0.data - b.data)
+        loss_R0 = sum(loss_R0_list)
         loss_r = F.sum(loss_R0 * chainer.Variable(penalty, volatile=chainer.flag.AUTO)) / batchsize
         loss_total = loss_c + self.coeff * loss_r
         if self.baseline == 'adaptive':
             loss_b = F.sum((chainer.Variable(loss_c0.data, volatile=chainer.flag.AUTO) - b)**2) / batchsize  # MSE between
-            loss_total += loss_b
+            loss_total += self.coeffb * loss_b
         reporter.report({'c': loss_c}, self)
         reporter.report({'r': loss_r}, self)
         reporter.report({'loss': loss_total}, self)
@@ -192,7 +226,7 @@ class ReinforceClassifier1(ReinforceClassifier):
         xp = cuda.get_array_module(x.data)
         self.ram.reset_state()
         l = chainer.Variable(xp.zeros((batchsize, 2)).astype(np.float32)+0.5, volatile=chainer.flag.AUTO)  # start from center
-        loss_R0 = 0
+        loss_R0_list = []
         self.l_list = [l]
 
         for s in range(self.len_seq):
@@ -202,7 +236,7 @@ class ReinforceClassifier1(ReinforceClassifier):
                                    volatile=chainer.flag.AUTO)
             # REINFORCE loss
             if s < self.len_seq - 1:
-                loss_R0 += self.ram.get_location_loss(l, l_sampled)
+                loss_R0_list.append(self.ram.get_location_loss(l, l_sampled))
             # compute next step
             ls = chainer.Variable(xp.array(l_sampled), volatile=chainer.flag.AUTO)
             c, l = self.ram(ls, rho)
@@ -225,15 +259,16 @@ class ReinforceClassifier1(ReinforceClassifier):
         else:
             raise ValueError('Unknown baseline mode')
         penalty = (miss - b)
+        loss_R0 = sum(loss_R0_list)
         loss_r = F.sum(loss_R0 * chainer.Variable(penalty, volatile=chainer.flag.AUTO)) / batchsize
         loss_total = loss_c + self.coeff * loss_r
         if self.baseline == 'adaptive':
             loss_b = F.sum((chainer.Variable(miss, volatile=chainer.flag.AUTO) - b)**2) / batchsize  # MSE between
-            loss_total += loss_b
+            loss_total += self.coeffb * loss_b
         reporter.report({'c': loss_c}, self)
         reporter.report({'r': loss_r}, self)
         reporter.report({'loss': loss_total}, self)
-
+        #from IPython import embed; embed()
         return loss_total
 
 
@@ -296,6 +331,8 @@ if __name__ == '__main__':
                         help='GPU ID (negative value indicates CPU)')
     parser.add_argument('--out', '-o', default='result',
                         help='Directory to output the result')
+    parser.add_argument('--model', default='ram0', choices=['ram0', 'ram1'],
+                        help='RAM model')
     parser.add_argument('--alg', default='rc', choices=['rc', 'rc1', 'rc2'],
                         help='Training algorithm')
     parser.add_argument('--resume', '-r', default='',
@@ -326,6 +363,7 @@ if __name__ == '__main__':
     print('# n_units: {}'.format(args.unit))
     print('# n_hidden: {}'.format(args.hidden))
     print('# Length of action sequence: {}'.format(args.len_seq))
+    print('# RAM model: {}'.format(args.model))
     print('# Reinforce Algorithm: {}'.format(args.alg))
     print('# scale: {}'.format(args.scale))
     print('# sigma: {}'.format(args.sigma))
@@ -336,12 +374,17 @@ if __name__ == '__main__':
     print('# Minibatch-size: {}'.format(args.batchsize))
     print('# epoch: {}'.format(args.epoch))
     print('')
-    save_path = 'alg={},unit={},hidden={},len={},scale={},sigma={},coeff={},opt={},baseline={},coeffb={}'.format(
-        args.alg, args.unit, args.hidden, args.len_seq, args.scale, args.sigma, args.coeff, args.opt, args.baseline,
-        args.coeffb)
+    save_path = 'model={},alg={},unit={},hidden={},len={},scale={},sigma={},coeff={},opt={},baseline={},coeffb={}'.format(
+        args.model, args.alg, args.unit, args.hidden, args.len_seq, args.scale, args.sigma, args.coeff, args.opt,
+        args.baseline, args.coeffb)
 
     n_in = int(np.round(28 * args.scale)**2)
-    ram = RAM0(args.unit, args.hidden, n_in, n_class=10, sigma=args.sigma)
+    if args.model == 'ram0':
+        ram = RAM0(args.unit, args.hidden, n_in, n_class=10, sigma=args.sigma)
+    elif args.model == 'ram1':
+        ram = RAM1(args.unit, args.hidden, n_in, n_class=10, sigma=args.sigma)
+    else:
+        raise ValueError('Unknown model')
     if args.alg == 'rc':
         model = ReinforceClassifier(ram, len_seq=args.len_seq, scale=args.scale, coeff=args.coeff,
                                     baseline=args.baseline, coeffb=args.coeffb)
